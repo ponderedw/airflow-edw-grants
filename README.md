@@ -28,5 +28,5 @@ pip install airflow-edw-grants
 
 and restart the web server.
 
-Add `redshift_connection_grants_name` variable with your Redshift connection name. 
+Add `redshift_connection_grants_name` variable with your Redshift connection name or create Redshift connection with a name `edw_con`. 
 
