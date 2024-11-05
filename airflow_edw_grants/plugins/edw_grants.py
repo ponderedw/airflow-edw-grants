@@ -5,6 +5,7 @@ from flask_login import current_user
 from flask_appbuilder import expose, BaseView as AppBuilderBaseView
 from airflow.hooks.base import BaseHook
 import pandas as pd
+import re
 from functools import wraps
 from flask_wtf import FlaskForm
 from wtforms import SelectMultipleField, SubmitField, StringField, BooleanField
@@ -131,6 +132,16 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
             "SVV_ROLES", self.metadata, Column("role_name", String), schema="pg_catalog"
         )
 
+    def sanitize_identifier(self, identifier):
+        # Allow only alphanumeric characters and underscores
+        if not re.match(r"^[A-Za-z0-9_]+$", identifier):
+            raise ValueError(f"Invalid identifier format: {identifier}")
+
+    def sanitize_identifiers(self, identifiers):
+        # Validate each identifier in the list, raising an error if any are invalid
+        for identifier in identifiers:
+            self.sanitize_identifier(identifier)
+
     def get_edw_connection_uri(self):
         conn_name = Variable.get(
             "redshift_connection_grants_name", default_var="edw_con"
@@ -256,6 +267,9 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
     def handle_roles_grants(
         self, engine, grants, object_name, grant_role_q, revoke_role_q
     ):
+        self.sanitize_identifiers(
+            [grant["grant_type"] for grant in grants] + [object_name]
+        )
         with engine.connect() as connection:
             with connection.begin():
                 for grant in grants:
@@ -354,6 +368,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         data = request.get_json()
         role_name = data.get("role_downstream")
         query = "drop role {role_name}"
+        self.sanitize_identifiers([role_name])
         with engine.connect() as connection:
             connection.execute(text(query.format(role_name=role_name)))
 
@@ -365,6 +380,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         data = request.get_json()
         user_name = data.get("user_name")
         query = "drop user {user_name}"
+        self.sanitize_identifiers([user_name])
         with engine.connect() as connection:
             connection.execute(text(query.format(user_name=user_name)))
 
@@ -380,6 +396,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         if form.validate_on_submit():
             role_name = form.role_name.data
             roles = form.roles.data
+            self.sanitize_identifiers([role_name] + roles)
             with engine.connect() as connection:
                 with connection.begin():
                     connection.execute(text(create_role_q.format(role_name=role_name)))
@@ -463,6 +480,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
             password = form.password.data
             roles = form.roles.data
             can_edit_database = form.can_edit_database.data
+            self.sanitize_identifiers([username, database_name] + roles)
             with engine.connect() as connection:
                 with connection.begin():
                     connection.execute(
@@ -505,6 +523,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         engine = self.get_edw_engine()
         database_name = self.get_edw_database()
         with engine.connect() as connection:
+            self.sanitize_identifiers([username, database_name])
             connection.execute(
                 text(
                     db_edit_grants_q.format(
