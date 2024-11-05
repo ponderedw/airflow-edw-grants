@@ -267,8 +267,9 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
     def handle_roles_grants(
         self, engine, grants, object_name, grant_role_q, revoke_role_q
     ):
-        self.sanitize_identifiers([grant["grant_type"] for grant in grants] +
-                                  [object_name])
+        self.sanitize_identifiers(
+            [grant["grant_type"] for grant in grants] + [object_name]
+        )
         with engine.connect() as connection:
             with connection.begin():
                 for grant in grants:
