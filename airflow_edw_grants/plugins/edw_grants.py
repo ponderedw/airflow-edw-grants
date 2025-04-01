@@ -78,7 +78,9 @@ def admin_only(f):
 
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if "Admin" not in [role.name for role in current_user.roles]:
+        users_roles = [role.name for role in current_user.roles]
+        approved_roles = ["Admin", "edw_grants"]
+        if any(role in users_roles for role in approved_roles):
             flash("You do not have permission to access this page.", "danger")
             return redirect(url_for("Airflow.index"))
         return f(*args, **kwargs)
