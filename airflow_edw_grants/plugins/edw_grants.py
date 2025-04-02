@@ -219,31 +219,26 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
                     ).label("must_granted"),
                 ]
             )
-            .where(
-                self.svv_roles_t.c.role_name != role_name
-            )
+            .where(self.svv_roles_t.c.role_name != role_name)
             .cte()
         )
         return base_query
 
     def get_users_roles_query(self, user_name, must_granted_list=[]):
-        base_query = (
-            select(
-                [
-                    self.svv_roles_t.c.role_name.label("object_name"),
-                    func.user_is_member_of(
-                        user_name, self.svv_roles_t.c.role_name
-                    ).label("granted"),
-                    case(
-                        [
-                            (self.svv_roles_t.c.role_name.in_(must_granted_list), True)
-                        ],  # <-- Tuple (condition, result)
-                        else_=False,  # Else clause for the case statement
-                    ).label("must_granted"),
-                ]
-            )
-            .cte()
-        )
+        base_query = select(
+            [
+                self.svv_roles_t.c.role_name.label("object_name"),
+                func.user_is_member_of(user_name, self.svv_roles_t.c.role_name).label(
+                    "granted"
+                ),
+                case(
+                    [
+                        (self.svv_roles_t.c.role_name.in_(must_granted_list), True)
+                    ],  # <-- Tuple (condition, result)
+                    else_=False,  # Else clause for the case statement
+                ).label("must_granted"),
+            ]
+        ).cte()
         return base_query
 
     def get_grant_revoke_query(self, base_query):
