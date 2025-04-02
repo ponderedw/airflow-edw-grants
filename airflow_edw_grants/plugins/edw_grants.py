@@ -21,7 +21,7 @@ from sqlalchemy import (
     func,
     select,
     case,
-    and_,
+    # and_,
 )
 from airflow.models import Variable
 from sqlalchemy_redshift.dialect import RedshiftDialect_psycopg2
@@ -175,7 +175,6 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
                     func.role_is_member_of(downstream.c.role_name, upstream.c.role_name)
                     | (downstream.c.role_name == upstream.c.role_name)
                 )
-                & downstream.c.role_name.notlike("%sys:%")
             )
             .distinct()
         )
@@ -221,10 +220,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
                 ]
             )
             .where(
-                and_(
-                    self.svv_roles_t.c.role_name.notlike("sys%"),
-                    self.svv_roles_t.c.role_name != role_name,
-                )
+                self.svv_roles_t.c.role_name != role_name
             )
             .cte()
         )
@@ -246,7 +242,6 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
                     ).label("must_granted"),
                 ]
             )
-            .where(self.svv_roles_t.c.role_name.notlike("sys%"))
             .cte()
         )
         return base_query
@@ -319,9 +314,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         self.handle_roles_grants(engine, grants, user_name, grant_role_q, revoke_role_q)
 
     def get_all_roles(self, engine):
-        query = select(self.svv_roles_t.c.role_name.label("role_name")).where(
-            self.svv_roles_t.c.role_name.notlike("%sys:%")
-        )
+        query = select(self.svv_roles_t.c.role_name.label("role_name"))
         compiled_query = query.compile(engine, compile_kwargs={"literal_binds": True})
         df = pd.read_sql(str(compiled_query), con=engine)
         return df
