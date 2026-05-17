@@ -273,27 +273,22 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         self.sanitize_identifiers(
             [grant["grant_type"] for grant in grants] + [object_name]
         )
+        quoted_object_name = self.quote_identifier(object_name)
         with engine.connect() as connection:
             with connection.begin():
                 for grant in grants:
                     if grant["grant_type"] == "grant":
-                        connection.execute(
-                            text(
-                                grant_role_q.format(
-                                    object_name=object_name,
-                                    up_role_name=grant["object_name"],
-                                )
-                            )
+                        query = grant_role_q.format(
+                            object_name=quoted_object_name,
+                            up_role_name=grant["object_name"],
                         )
                     else:
-                        connection.execute(
-                            text(
-                                revoke_role_q.format(
-                                    object_name=object_name,
-                                    up_role_name=grant["object_name"],
-                                )
-                            )
+                        query = revoke_role_q.format(
+                            object_name=quoted_object_name,
+                            up_role_name=grant["object_name"],
                         )
+                    print(f"PLUGIN QUERY: {query}")
+                    connection.execute(text(query))
 
     def get_roles_grants(self, engine, base_query):
         final_query = self.get_grant_revoke_query(base_query)
@@ -317,8 +312,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         grants = self.get_roles_grants(engine, base_query)
         grant_role_q = "grant role {up_role_name} to {object_name}"
         revoke_role_q = "revoke role {up_role_name} from {object_name}"
-        quoted_user_name = self.quote_identifier(user_name)
-        self.handle_roles_grants(engine, grants, quoted_user_name, grant_role_q, revoke_role_q)
+        self.handle_roles_grants(engine, grants, user_name, grant_role_q, revoke_role_q)
 
     def get_all_roles(self, engine):
         query = select(self.svv_roles_t.c.role_name.label("role_name"))
