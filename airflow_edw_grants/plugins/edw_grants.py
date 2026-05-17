@@ -135,14 +135,25 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         )
 
     def sanitize_identifier(self, identifier):
-        # Allow only alphanumeric characters and underscores
-        if not re.match(r"^[A-Za-z0-9_]+$", identifier):
-            raise ValueError(f"Invalid identifier format: {identifier}")
+        # Allow simple identifiers (alphanumeric + underscore)
+        if re.match(r"^[A-Za-z0-9_]+$", identifier):
+            return
+        # Allow IAM-style identifiers with special chars (colon, dot, at, hyphen, plus)
+        if re.match(r"^[A-Za-z0-9_.@:\-+]+$", identifier):
+            return
+        raise ValueError(f"Invalid identifier format: {identifier}")
 
     def sanitize_identifiers(self, identifiers):
         # Validate each identifier in the list, raising an error if any are invalid
         for identifier in identifiers:
             self.sanitize_identifier(identifier)
+
+    def quote_identifier(self, identifier):
+        # Wrap in double quotes if the identifier contains special characters
+        if not re.match(r"^[A-Za-z0-9_]+$", identifier):
+            escaped = identifier.replace('"', '""')
+            return f'"{escaped}"'
+        return identifier
 
     def get_edw_connection_uri(self):
         conn_name = Variable.get(
@@ -306,7 +317,8 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         grants = self.get_roles_grants(engine, base_query)
         grant_role_q = "grant role {up_role_name} to {object_name}"
         revoke_role_q = "revoke role {up_role_name} from {object_name}"
-        self.handle_roles_grants(engine, grants, user_name, grant_role_q, revoke_role_q)
+        quoted_user_name = self.quote_identifier(user_name)
+        self.handle_roles_grants(engine, grants, quoted_user_name, grant_role_q, revoke_role_q)
 
     def get_all_roles(self, engine):
         query = select(self.svv_roles_t.c.role_name.label("role_name"))
