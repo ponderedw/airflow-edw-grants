@@ -134,6 +134,7 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
             "SVV_ROLES", self.metadata, Column("role_name", String), schema="pg_catalog"
         )
 
+
     def sanitize_identifier(self, identifier):
         # Allow simple identifiers (alphanumeric + underscore)
         if re.match(r"^[A-Za-z0-9_]+$", identifier):
@@ -379,6 +380,19 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
         self.sanitize_identifiers([user_name])
         with engine.connect() as connection:
             connection.execute(text(query.format(user_name=user_name)))
+
+    @expose("/disable_user", methods=["PUT"])
+    @admin_only
+    @failure_tollerant_front_end
+    def disable_user(self):
+        engine = self.get_edw_engine()
+        data = request.get_json()
+        user_name = data.get("user_name")
+        self.sanitize_identifiers([user_name])
+        quoted_user_name = self.quote_identifier(user_name)
+        query = f"ALTER USER {quoted_user_name} PASSWORD DISABLE"
+        with engine.connect() as connection:
+            connection.execute(text(query))
 
     @expose("/add_role_page", methods=["GET", "POST"])
     @admin_only

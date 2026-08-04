@@ -13,6 +13,7 @@
           <th>Can Edit Database</th>
           <th></th>
           <th></th>
+          <th></th>
         </tr>
       </thead>
       <tbody>
@@ -47,6 +48,13 @@
           </a></td>
           <td>
             <a href="#" class="btn btn-sm btn-default"
+            data-toggle="tooltip" rel="tooltip" title="" data-original-title="Disable User" onclick="disableUser('{{ row.username }}')">
+            <span class="sr-only">Disable</span>
+            <i class="fa fa-ban"></i>
+          </a>
+          </td>
+          <td>
+            <a href="#" class="btn btn-sm btn-default"
             data-toggle="tooltip" rel="tooltip" title="" data-original-title="Delete User" onclick="deleteUser('{{ row.username }}')">
             <span class="sr-only">Delete</span>
             <i class="fa fa-trash"></i>
@@ -59,6 +67,8 @@
               data-toggle="tooltip" rel="tooltip" title="" data-original-title="Add User">
               <span class="sr-only">Add User</span>
               <i class="fa fa-plus-circle"></i></a></td>
+          <td>
+          </td>
           <td>
           </td>
           <td>
@@ -168,6 +178,28 @@
         const url = "{{ url_for('EdwGrantsAppBuilderBaseView.delete_user') }}";
         fetch(url, {
             method: 'DELETE',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-CSRFToken': '{{ csrf_token() }}'
+            },
+            body: JSON.stringify({ user_name: userName })
+        })
+        .then(response => response.json())
+        .then(data => {
+          location.reload();
+        })
+        .catch(error => {
+          console.error('Error');
+          location.reload();
+        });
+    }
+  }
+
+  function disableUser(userName) {
+    if (confirm('Are you sure you want to disable this user?')) {
+        const url = "{{ url_for('EdwGrantsAppBuilderBaseView.disable_user') }}";
+        fetch(url, {
+            method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
                 'X-CSRFToken': '{{ csrf_token() }}'
