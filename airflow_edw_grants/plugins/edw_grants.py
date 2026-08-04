@@ -349,12 +349,17 @@ class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
 
     @expose("/")
     @admin_only
-    @failure_tollerant
     def main(self):
-        engine = self.get_edw_engine()
-        database_name = self.get_edw_database()
-        roles = self.get_roles_dependencies(engine)
-        users = self.get_users(engine, database_name)
+        try:
+            uri = self.get_edw_connection_uri()
+            engine = create_engine(uri)
+            database_name = uri.split("/")[-1]
+            roles = self.get_roles_dependencies(engine)
+            users = self.get_users(engine, database_name)
+        except Exception as e:
+            flash("Could not connect to EDW. Check the connection configuration.", "danger")
+            print(f"PLUGIN FAILURE: {e}")
+            roles, users = [], []
         return self.render_template("edw_grants.html", roles=roles, users=users)
 
     @expose("/delete_role", methods=["DELETE"])
