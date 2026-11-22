@@ -35,6 +35,10 @@ pg_user_t = Table("pg_user", _metadata, Column("usename", String), schema="pg_ca
 svv_roles_t = Table("SVV_ROLES", _metadata, Column("role_name", String), schema="pg_catalog")
 
 
+# ---------------------------------------------------------------------------
+# Identifier helpers
+# ---------------------------------------------------------------------------
+
 def sanitize_identifier(identifier):
     if re.match(r"^[A-Za-z0-9_]+$", identifier):
         return
@@ -49,11 +53,20 @@ def sanitize_identifiers(identifiers):
 
 
 def quote_identifier(identifier):
+    """Wrap in double-quotes when the identifier contains characters beyond simple alphanumeric (e.g. IAM:user@domain.com)."""
     if not re.match(r"^[A-Za-z0-9_]+$", identifier):
         escaped = identifier.replace('"', '""')
         return f'"{escaped}"'
     return identifier
 
+
+def is_iam_user(username: str) -> bool:
+    return username.upper().startswith("IAM:")
+
+
+# ---------------------------------------------------------------------------
+# Connection helpers
+# ---------------------------------------------------------------------------
 
 def get_edw_connection_uri():
     conn_name = Variable.get("redshift_connection_grants_name", default_var="edw_con")
@@ -68,6 +81,10 @@ def get_edw_engine():
 def get_edw_database():
     return get_edw_connection_uri().split("/")[-1]
 
+
+# ---------------------------------------------------------------------------
+# Data access
+# ---------------------------------------------------------------------------
 
 def get_all_roles_list(engine):
     query = select(svv_roles_t.c.role_name.label("role_name"))
@@ -262,7 +279,9 @@ async def main(request: Request, flash: str = None):
         error = None
     except Exception as e:
         print(f"PLUGIN FAILURE: {e}")
-        roles, users, error = [], [], "Could not connect to EDW. Check the connection configuration."
+        roles, users, error = [], [], (
+            "Could not connect to EDW. Check the connection configuration."
+        )
     return templates.TemplateResponse(request, "edw_grants.html", {
         "roles": roles,
         "users": users,
@@ -291,9 +310,10 @@ async def delete_user(body: DeleteUserBody):
     try:
         engine = get_edw_engine()
         sanitize_identifiers([body.user_name])
+        quoted = quote_identifier(body.user_name)
         with engine.connect() as conn:
             with conn.begin():
-                conn.execute(text(f"drop user {body.user_name}"))
+                conn.execute(text(f"drop user {quoted}"))
         return JSONResponse({"Status": "Succeeded"})
     except Exception as e:
         print(f"PLUGIN FAILURE: {e}")
@@ -419,30 +439,44 @@ async def add_user_page_get(request: Request, error: str = None):
 @app.post("/add_user_page")
 async def add_user_page_post(
     username: str = Form(...),
-    password: str = Form(...),
+    password: str = Form(default=""),
     roles: list[str] = Form(default=[]),
     can_edit_database: str = Form(default=""),
 ):
-    pw_error = _validate_redshift_password(password)
-    if pw_error:
-        return RedirectResponse(
-            url=f"{URL_PREFIX}/add_user_page?error={pw_error}", status_code=302
-        )
+    iam = is_iam_user(username)
+
+    if not iam:
+        pw_error = _validate_redshift_password(password)
+        if pw_error:
+            return RedirectResponse(
+                url=f"{URL_PREFIX}/add_user_page?error={pw_error}", status_code=302
+            )
+
     try:
         engine = get_edw_engine()
         database_name = get_edw_database()
         sanitize_identifiers([username, database_name] + roles)
+        quoted_username = quote_identifier(username)
         with engine.connect() as conn:
             with conn.begin():
-                conn.execute(
-                    text(f"create user {username} password :password"),
-                    {"password": password},
-                )
+                if iam:
+                    # IAM users authenticate via AWS — no Redshift password needed
+                    conn.execute(
+                        text(f"create user {quoted_username} password disable")
+                    )
+                else:
+                    conn.execute(
+                        text(f"create user {quoted_username} password :password"),
+                        {"password": password},
+                    )
                 for r in roles:
-                    conn.execute(text(f"grant role {r} to {username}"))
+                    conn.execute(text(f"grant role {r} to {quoted_username}"))
                 if can_edit_database:
                     conn.execute(
-                        text(f"grant create on database {database_name} to {username}")
+                        text(
+                            f"grant create on database {database_name}"
+                            f" to {quoted_username}"
+                        )
                     )
     except Exception as e:
         print(f"PLUGIN FAILURE: {e}")
@@ -455,10 +489,11 @@ async def update_edit_db_grant(body: UpdateDbGrantBody):
         engine = get_edw_engine()
         database_name = get_edw_database()
         sanitize_identifiers([body.username, database_name])
+        quoted_username = quote_identifier(body.username)
         if body.status == "true":
-            q = f"grant create on database {database_name} to {body.username}"
+            q = f"grant create on database {database_name} to {quoted_username}"
         else:
-            q = f"revoke create on database {database_name} from {body.username}"
+            q = f"revoke create on database {database_name} from {quoted_username}"
         with engine.connect() as conn:
             with conn.begin():
                 conn.execute(text(q))
@@ -483,6 +518,6 @@ class AirflowEdwGrantsPlugin(AirflowPlugin):
         "name": "Permissions",
         "href": "/edw_grants/",
         "destination": "nav",
-        "category": "EDW",
+        "category": "browse",
         "url_route": "edw_grants",
     }]
