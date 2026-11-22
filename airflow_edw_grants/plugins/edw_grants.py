@@ -1,565 +1,488 @@
-from airflow import settings
-from airflow.plugins_manager import AirflowPlugin
-from flask import Blueprint, redirect, flash, url_for, request, jsonify
-from flask_login import current_user
-from flask_appbuilder import expose, BaseView as AppBuilderBaseView
-from airflow.hooks.base import BaseHook
-import pandas as pd
+import os
 import re
-from functools import wraps
-from flask_wtf import FlaskForm
-from wtforms import SelectMultipleField, SubmitField, StringField, BooleanField
-from wtforms.validators import Optional, DataRequired
-from wtforms import ValidationError
+
+import pandas as pd
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.templating import Jinja2Templates
+from airflow.hooks.base import BaseHook
+from airflow.models import Variable
+from airflow.plugins_manager import AirflowPlugin
+from pydantic import BaseModel
 from sqlalchemy import (
-    create_engine,
-    text,
-    Table,
     Column,
-    String,
     MetaData,
+    String,
+    Table,
+    case,
+    create_engine,
     func,
     select,
-    case,
-    # and_,
+    text,
 )
-from airflow.models import Variable
 from sqlalchemy_redshift.dialect import RedshiftDialect_psycopg2
-
 
 RedshiftDialect_psycopg2.supports_statement_cache = True
 
+URL_PREFIX = "/edw_grants"
 
-class RolePermissionForm(FlaskForm):
-    role_name = StringField("Input Role")
-    roles = SelectMultipleField("Select Roles", choices=[], validators=[Optional()])
-    submit = SubmitField("Submit")
+app = FastAPI()
+_template_dir = os.path.join(os.path.dirname(__file__), "templates")
+templates = Jinja2Templates(directory=_template_dir)
 
-
-def validate_redshift_password(form, field):
-    if not any(c.isupper() for c in field.data):
-        raise ValidationError("Field must contain at least one uppercase letter.")
-    if not any(c.islower() for c in field.data):
-        raise ValidationError("Field must contain at least one lowercase letter.")
-    if not any(c.isdigit() for c in field.data):
-        raise ValidationError("Field must contain at least one digit.")
+_metadata = MetaData()
+pg_user_t = Table("pg_user", _metadata, Column("usename", String), schema="pg_catalog")
+svv_roles_t = Table("SVV_ROLES", _metadata, Column("role_name", String), schema="pg_catalog")
 
 
-class NewUserForm(FlaskForm):
-    username = StringField("Input Username", validators=[DataRequired()])
-    password = StringField(
-        "Input Password", validators=[DataRequired(), validate_redshift_password]
+def sanitize_identifier(identifier):
+    if re.match(r"^[A-Za-z0-9_]+$", identifier):
+        return
+    if re.match(r"^[A-Za-z0-9_.@:\-+]+$", identifier):
+        return
+    raise ValueError(f"Invalid identifier format: {identifier}")
+
+
+def sanitize_identifiers(identifiers):
+    for identifier in identifiers:
+        sanitize_identifier(identifier)
+
+
+def quote_identifier(identifier):
+    if not re.match(r"^[A-Za-z0-9_]+$", identifier):
+        escaped = identifier.replace('"', '""')
+        return f'"{escaped}"'
+    return identifier
+
+
+def get_edw_connection_uri():
+    conn_name = Variable.get("redshift_connection_grants_name", default_var="edw_con")
+    connection = BaseHook.get_connection(conn_name)
+    return connection.get_uri()
+
+
+def get_edw_engine():
+    return create_engine(get_edw_connection_uri())
+
+
+def get_edw_database():
+    return get_edw_connection_uri().split("/")[-1]
+
+
+def get_all_roles_list(engine):
+    query = select(svv_roles_t.c.role_name.label("role_name"))
+    compiled = query.compile(engine, compile_kwargs={"literal_binds": True})
+    df = pd.read_sql(str(compiled), con=engine)
+    return df["role_name"].tolist()
+
+
+def get_roles_dependencies(engine):
+    downstream = svv_roles_t.alias("dependent_roles")
+    upstream = svv_roles_t.alias("roles")
+    query = (
+        select(
+            downstream.c.role_name.label("role_downstream"),
+            upstream.c.role_name.label("role_upstream"),
+        )
+        .where(
+            func.role_is_member_of(downstream.c.role_name, upstream.c.role_name)
+            | (downstream.c.role_name == upstream.c.role_name)
+        )
+        .distinct()
     )
-    roles = SelectMultipleField("Select Roles", choices=[], validators=[Optional()])
-    can_edit_database = BooleanField("Can Edit Database")
-    submit = SubmitField("Submit")
+    compiled = query.compile(engine, compile_kwargs={"literal_binds": True})
+    df = pd.read_sql(str(compiled), con=engine)
+    df = (
+        df.groupby("role_downstream")["role_upstream"]
+        .agg(lambda x: list(set(x)))
+        .reset_index()
+    )
+    return df.sort_values(by=["role_downstream"]).to_dict("records")
 
 
-class AddRolesToUser(FlaskForm):
-    user_name = StringField("Input Role")
-    roles = SelectMultipleField("Select Roles", choices=[], validators=[Optional()])
-    submit = SubmitField("Submit")
-
-
-session = settings.Session()
-
-
-bp = Blueprint(
-    "edw_grants",
-    __name__,
-    template_folder="templates",
-    static_folder="static",
-    static_url_path="/static/edw_grants_plugin",
-)
-
-
-def admin_only(f):
-    """Decorator to restrict access to Admin role."""
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        users_roles = [role.name for role in current_user.roles]
-        approved_roles = ["Admin", "edw_grants"]
-        if not any(role in users_roles for role in approved_roles):
-            flash("You do not have permission to access this page.", "danger")
-            return redirect(url_for("Airflow.index"))
-        return f(*args, **kwargs)
-
-    return decorated_function
-
-
-def failure_tollerant(f):
-    """Decorator to restrict access to Admin role."""
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        try:
-            return f(*args, **kwargs)
-        except Exception as e:
-            flash("Something went wrong...", "danger")
-            print(f"PLUGIN FAILURE: {e}")
-            return redirect(url_for("EdwGrantsAppBuilderBaseView.main"))
-
-    return decorated_function
-
-
-def failure_tollerant_front_end(f):
-    """Decorator to restrict access to Admin role."""
-
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        try:
-            f(*args, **kwargs)
-            return jsonify({"Status": "Succeeded"}), 200
-        except Exception:
-            flash("Something went wrong...", "danger")
-            jsonify({"Status": "Failed"}), 404
-
-    return decorated_function
-
-
-class EdwGrantsAppBuilderBaseView(AppBuilderBaseView):
-    default_view = "main"
-    route_base = "/edw_grants"
-
-    def __init__(self, **kwargs):
-        # Pass parent_var and any other keyword arguments to the ParentClass
-        super().__init__(**kwargs)
-        self.metadata = MetaData()
-        self.pg_user_t = Table(
-            "pg_user", self.metadata, Column("usename", String), schema="pg_catalog"
+def get_users(engine, database_name):
+    query = select(
+        pg_user_t.c.usename.label("username"),
+        svv_roles_t.c.role_name,
+        func.has_database_privilege(pg_user_t.c.usename, database_name, "CREATE").label(
+            "can_create"
+        ),
+    ).select_from(
+        pg_user_t.outerjoin(
+            svv_roles_t,
+            func.user_is_member_of(pg_user_t.c.usename, svv_roles_t.c.role_name),
         )
+    )
+    compiled = query.compile(engine, compile_kwargs={"literal_binds": True})
+    df = pd.read_sql(str(compiled), con=engine)
+    df_roles = (
+        df.groupby("username")["role_name"]
+        .agg(lambda x: list(set(x)))
+        .reset_index()
+    )
+    df_unique = df[["username", "can_create"]].drop_duplicates()
+    df = df_unique.merge(df_roles, on="username")
+    return df.sort_values(by=["username"]).to_dict("records")
 
-        self.svv_roles_t = Table(
-            "SVV_ROLES", self.metadata, Column("role_name", String), schema="pg_catalog"
+
+def _roles_roles_query(role_name, must_granted_list=None):
+    if must_granted_list is None:
+        must_granted_list = []
+    return (
+        select(
+            svv_roles_t.c.role_name.label("object_name"),
+            func.role_is_member_of(role_name, svv_roles_t.c.role_name).label("granted"),
+            case(
+                (svv_roles_t.c.role_name.in_(must_granted_list), True),
+                else_=False,
+            ).label("must_granted"),
         )
+        .where(svv_roles_t.c.role_name != role_name)
+        .cte()
+    )
 
 
-    def sanitize_identifier(self, identifier):
-        # Allow simple identifiers (alphanumeric + underscore)
-        if re.match(r"^[A-Za-z0-9_]+$", identifier):
-            return
-        # Allow IAM-style identifiers with special chars (colon, dot, at, hyphen, plus)
-        if re.match(r"^[A-Za-z0-9_.@:\-+]+$", identifier):
-            return
-        raise ValueError(f"Invalid identifier format: {identifier}")
+def _users_roles_query(user_name, must_granted_list=None):
+    if must_granted_list is None:
+        must_granted_list = []
+    return select(
+        svv_roles_t.c.role_name.label("object_name"),
+        func.user_is_member_of(user_name, svv_roles_t.c.role_name).label("granted"),
+        case(
+            (svv_roles_t.c.role_name.in_(must_granted_list), True),
+            else_=False,
+        ).label("must_granted"),
+    ).cte()
 
-    def sanitize_identifiers(self, identifiers):
-        # Validate each identifier in the list, raising an error if any are invalid
-        for identifier in identifiers:
-            self.sanitize_identifier(identifier)
 
-    def quote_identifier(self, identifier):
-        # Wrap in double quotes if the identifier contains special characters
-        if not re.match(r"^[A-Za-z0-9_]+$", identifier):
-            escaped = identifier.replace('"', '""')
-            return f'"{escaped}"'
-        return identifier
+def _grant_revoke_query(base_query):
+    return select(
+        base_query.c.object_name,
+        (base_query.c.granted != base_query.c.must_granted).label("ind_relevant"),
+        case(
+            (base_query.c.must_granted == text("True"), "grant"),
+            else_="revoke",
+        ).label("grant_type"),
+    )
 
-    def get_edw_connection_uri(self):
-        conn_name = Variable.get(
-            "redshift_connection_grants_name", default_var="edw_con"
-        )
-        connection = BaseHook.get_connection(conn_name)
-        uri = connection.get_uri()
-        return uri
 
-    def get_edw_engine(self):
-        uri = self.get_edw_connection_uri()
+def _compute_grants(engine, base_query):
+    final_query = _grant_revoke_query(base_query)
+    compiled = final_query.compile(engine, compile_kwargs={"literal_binds": True})
+    df = pd.read_sql(str(compiled), con=engine)
+    return df[df["ind_relevant"]].to_dict("records")
+
+
+def _apply_grants(engine, grants, object_name, grant_q, revoke_q):
+    sanitize_identifiers([g["grant_type"] for g in grants] + [object_name])
+    quoted = quote_identifier(object_name)
+    with engine.connect() as conn:
+        with conn.begin():
+            for g in grants:
+                q = (grant_q if g["grant_type"] == "grant" else revoke_q).format(
+                    object_name=quoted, up_role_name=g["object_name"]
+                )
+                print(f"PLUGIN QUERY: {q}")
+                conn.execute(text(q))
+
+
+def edit_roles_roles(engine, role_name, must_granted_list):
+    _apply_grants(
+        engine,
+        _compute_grants(engine, _roles_roles_query(role_name, must_granted_list)),
+        role_name,
+        "grant role {up_role_name} to role {object_name}",
+        "revoke role {up_role_name} from role {object_name}",
+    )
+
+
+def edit_users_roles(engine, user_name, must_granted_list):
+    _apply_grants(
+        engine,
+        _compute_grants(engine, _users_roles_query(user_name, must_granted_list)),
+        user_name,
+        "grant role {up_role_name} to {object_name}",
+        "revoke role {up_role_name} from {object_name}",
+    )
+
+
+def _validate_redshift_password(password: str) -> str | None:
+    if not any(c.isupper() for c in password):
+        return "Password must contain at least one uppercase letter."
+    if not any(c.islower() for c in password):
+        return "Password must contain at least one lowercase letter."
+    if not any(c.isdigit() for c in password):
+        return "Password must contain at least one digit."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pydantic request models
+# ---------------------------------------------------------------------------
+
+class DeleteRoleBody(BaseModel):
+    role_downstream: str
+
+
+class DeleteUserBody(BaseModel):
+    user_name: str
+
+
+class DisableUserBody(BaseModel):
+    user_name: str
+
+
+class UpdateDbGrantBody(BaseModel):
+    username: str
+    status: str
+
+
+class EditRoleBody(BaseModel):
+    role_name: str
+    roles: list[str]
+
+
+class EditUserBody(BaseModel):
+    user_name: str
+    roles: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def main(request: Request, flash: str = None):
+    try:
+        uri = get_edw_connection_uri()
         engine = create_engine(uri)
-        return engine
-
-    def get_edw_database(self):
-        uri = self.get_edw_connection_uri()
         database_name = uri.split("/")[-1]
-        return database_name
+        roles = get_roles_dependencies(engine)
+        users = get_users(engine, database_name)
+        error = None
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        roles, users, error = [], [], "Could not connect to EDW. Check the connection configuration."
+    return templates.TemplateResponse(request, "edw_grants.html", {
+        "roles": roles,
+        "users": users,
+        "error": error,
+        "flash": flash,
+        "prefix": URL_PREFIX,
+    })
 
-    def get_current_dbt_metadata_roles(self, engine):
-        downstream = self.svv_roles_t.alias("dependent_roles")
-        upstream = self.svv_roles_t.alias("roles")
-        base_query = (
-            select(
-                downstream.c.role_name.label("role_downstream"),
-                upstream.c.role_name.label("role_upstream"),
-            )
-            .where(
-                (
-                    func.role_is_member_of(downstream.c.role_name, upstream.c.role_name)
-                    | (downstream.c.role_name == upstream.c.role_name)
+
+@app.delete("/delete_role")
+async def delete_role(body: DeleteRoleBody):
+    try:
+        engine = get_edw_engine()
+        sanitize_identifiers([body.role_downstream])
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(f"drop role {body.role_downstream}"))
+        return JSONResponse({"Status": "Succeeded"})
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"Status": "Failed"}, status_code=500)
+
+
+@app.delete("/delete_user")
+async def delete_user(body: DeleteUserBody):
+    try:
+        engine = get_edw_engine()
+        sanitize_identifiers([body.user_name])
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(f"drop user {body.user_name}"))
+        return JSONResponse({"Status": "Succeeded"})
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"Status": "Failed"}, status_code=500)
+
+
+@app.put("/disable_user")
+async def disable_user(body: DisableUserBody):
+    try:
+        engine = get_edw_engine()
+        sanitize_identifiers([body.user_name])
+        quoted = quote_identifier(body.user_name)
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(f"ALTER USER {quoted} PASSWORD DISABLE"))
+        return JSONResponse({"Status": "Succeeded"})
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"Status": "Failed"}, status_code=500)
+
+
+@app.get("/add_role_page", response_class=HTMLResponse)
+async def add_role_page_get(request: Request):
+    try:
+        all_roles = get_all_roles_list(get_edw_engine())
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        all_roles = []
+    return templates.TemplateResponse(request, "add_role.html", {
+        "all_roles": all_roles,
+        "prefix": URL_PREFIX,
+    })
+
+
+@app.post("/add_role_page")
+async def add_role_page_post(
+    role_name: str = Form(...),
+    roles: list[str] = Form(default=[]),
+):
+    try:
+        engine = get_edw_engine()
+        sanitize_identifiers([role_name] + roles)
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(f"create role {role_name}"))
+                for r in roles:
+                    conn.execute(text(f"grant role {r} to role {role_name}"))
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+    return RedirectResponse(url=f"{URL_PREFIX}/", status_code=302)
+
+
+@app.get("/edit_role_page/{role_name}/{roles}", response_class=HTMLResponse)
+async def edit_role_page_get(request: Request, role_name: str, roles: str):
+    try:
+        all_roles = get_all_roles_list(get_edw_engine())
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        all_roles = []
+    return templates.TemplateResponse(request, "edit_role.html", {
+        "role_name": role_name,
+        "current_roles": [r for r in roles.split(",") if r],
+        "all_roles": all_roles,
+        "prefix": URL_PREFIX,
+    })
+
+
+@app.put("/edit_role_page/{role_name}/{roles}")
+async def edit_role_page_put(role_name: str, roles: str, body: EditRoleBody):
+    try:
+        engine = get_edw_engine()
+        edit_roles_roles(engine, body.role_name, body.roles)
+        return JSONResponse({
+            "message": "Role updated successfully",
+            "role_name": body.role_name,
+            "roles": body.roles,
+        })
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"message": "Failed"}, status_code=500)
+
+
+@app.get("/edit_user_page/{user_name}/{roles}", response_class=HTMLResponse)
+async def edit_user_page_get(request: Request, user_name: str, roles: str):
+    try:
+        all_roles = get_all_roles_list(get_edw_engine())
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        all_roles = []
+    return templates.TemplateResponse(request, "edit_user.html", {
+        "user_name": user_name,
+        "current_roles": [r for r in roles.split(",") if r],
+        "all_roles": all_roles,
+        "prefix": URL_PREFIX,
+    })
+
+
+@app.put("/edit_user_page/{user_name}/{roles}")
+async def edit_user_page_put(user_name: str, roles: str, body: EditUserBody):
+    try:
+        engine = get_edw_engine()
+        edit_users_roles(engine, body.user_name, body.roles)
+        return JSONResponse({"message": "User updated successfully", "roles": body.roles})
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"message": "Failed"}, status_code=500)
+
+
+@app.get("/add_user_page", response_class=HTMLResponse)
+async def add_user_page_get(request: Request, error: str = None):
+    try:
+        all_roles = get_all_roles_list(get_edw_engine())
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        all_roles = []
+    return templates.TemplateResponse(request, "add_user.html", {
+        "all_roles": all_roles,
+        "error": error,
+        "prefix": URL_PREFIX,
+    })
+
+
+@app.post("/add_user_page")
+async def add_user_page_post(
+    username: str = Form(...),
+    password: str = Form(...),
+    roles: list[str] = Form(default=[]),
+    can_edit_database: str = Form(default=""),
+):
+    pw_error = _validate_redshift_password(password)
+    if pw_error:
+        return RedirectResponse(
+            url=f"{URL_PREFIX}/add_user_page?error={pw_error}", status_code=302
+        )
+    try:
+        engine = get_edw_engine()
+        database_name = get_edw_database()
+        sanitize_identifiers([username, database_name] + roles)
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(
+                    text(f"create user {username} password :password"),
+                    {"password": password},
                 )
-            )
-            .distinct()
-        )
-        compiled_query = base_query.compile(
-            engine, compile_kwargs={"literal_binds": True}
-        )
-        df = pd.read_sql(str(compiled_query), con=engine)
-        return df
-
-    def get_current_dbt_metadata_users(self, engine, database_name):
-        query = select(
-            self.pg_user_t.c.usename.label("username"),
-            self.svv_roles_t.c.role_name,
-            func.has_database_privilege(
-                self.pg_user_t.c.usename, database_name, "CREATE"
-            ).label("can_create"),
-        ).select_from(
-            self.pg_user_t.outerjoin(
-                self.svv_roles_t,
-                func.user_is_member_of(
-                    self.pg_user_t.c.usename, self.svv_roles_t.c.role_name
-                ),
-            )
-        )
-        compiled_query = query.compile(engine, compile_kwargs={"literal_binds": True})
-        df = pd.read_sql(str(compiled_query), con=engine)
-        return df
-
-    def get_roles_roles_query(self, role_name, must_granted_list=[]):
-        base_query = (
-            select(
-                [
-                    self.svv_roles_t.c.role_name.label("object_name"),
-                    func.role_is_member_of(
-                        role_name, self.svv_roles_t.c.role_name
-                    ).label("granted"),
-                    case(
-                        [
-                            (self.svv_roles_t.c.role_name.in_(must_granted_list), True)
-                        ],  # <-- Tuple (condition, result)
-                        else_=False,  # Else clause for the case statement
-                    ).label("must_granted"),
-                ]
-            )
-            .where(self.svv_roles_t.c.role_name != role_name)
-            .cte()
-        )
-        return base_query
-
-    def get_users_roles_query(self, user_name, must_granted_list=[]):
-        base_query = select(
-            [
-                self.svv_roles_t.c.role_name.label("object_name"),
-                func.user_is_member_of(user_name, self.svv_roles_t.c.role_name).label(
-                    "granted"
-                ),
-                case(
-                    [
-                        (self.svv_roles_t.c.role_name.in_(must_granted_list), True)
-                    ],  # <-- Tuple (condition, result)
-                    else_=False,  # Else clause for the case statement
-                ).label("must_granted"),
-            ]
-        ).cte()
-        return base_query
-
-    def get_grant_revoke_query(self, base_query):
-        final_query = select(
-            [
-                base_query.c.object_name,
-                (base_query.c.granted != base_query.c.must_granted).label(
-                    "ind_relevant"
-                ),
-                case(
-                    [(base_query.c.must_granted == text("True"), "grant")],
-                    else_="revoke",
-                ).label("grant_type"),
-            ]
-        )
-        return final_query
-
-    def handle_roles_grants(
-        self, engine, grants, object_name, grant_role_q, revoke_role_q
-    ):
-        self.sanitize_identifiers(
-            [grant["grant_type"] for grant in grants] + [object_name]
-        )
-        quoted_object_name = self.quote_identifier(object_name)
-        with engine.connect() as connection:
-            with connection.begin():
-                for grant in grants:
-                    if grant["grant_type"] == "grant":
-                        query = grant_role_q.format(
-                            object_name=quoted_object_name,
-                            up_role_name=grant["object_name"],
-                        )
-                    else:
-                        query = revoke_role_q.format(
-                            object_name=quoted_object_name,
-                            up_role_name=grant["object_name"],
-                        )
-                    print(f"PLUGIN QUERY: {query}")
-                    connection.execute(text(query))
-
-    def get_roles_grants(self, engine, base_query):
-        final_query = self.get_grant_revoke_query(base_query)
-        compiled_query = final_query.compile(
-            engine, compile_kwargs={"literal_binds": True}
-        )
-        df = pd.read_sql(str(compiled_query), con=engine)
-        df = df[df["ind_relevant"]]
-        grants = df.to_dict("records")
-        return grants
-
-    def edit_roles_roles(self, engine, role_name, must_granted_list):
-        base_query = self.get_roles_roles_query(role_name, must_granted_list)
-        grants = self.get_roles_grants(engine, base_query)
-        grant_role_q = "grant role {up_role_name} to role {object_name}"
-        revoke_role_q = "revoke role {up_role_name} from role {object_name}"
-        self.handle_roles_grants(engine, grants, role_name, grant_role_q, revoke_role_q)
-
-    def edit_users_roles(self, engine, user_name, must_granted_list):
-        base_query = self.get_users_roles_query(user_name, must_granted_list)
-        grants = self.get_roles_grants(engine, base_query)
-        grant_role_q = "grant role {up_role_name} to {object_name}"
-        revoke_role_q = "revoke role {up_role_name} from {object_name}"
-        self.handle_roles_grants(engine, grants, user_name, grant_role_q, revoke_role_q)
-
-    def get_all_roles(self, engine):
-        query = select(self.svv_roles_t.c.role_name.label("role_name"))
-        compiled_query = query.compile(engine, compile_kwargs={"literal_binds": True})
-        df = pd.read_sql(str(compiled_query), con=engine)
-        return df
-
-    def get_roles_dependencies(self, engine):
-        df = self.get_current_dbt_metadata_roles(engine)
-        df = (
-            df.groupby("role_downstream")["role_upstream"]
-            .agg(lambda x: list(set(x)))
-            .reset_index()
-        )
-        df = df.sort_values(by=["role_downstream"])
-        return df.to_dict("records")
-
-    def get_users(self, engine, database_name):
-        df = self.get_current_dbt_metadata_users(engine, database_name)
-        df_roles = (
-            df.groupby("username")["role_name"]
-            .agg(lambda x: list(set(x)))
-            .reset_index()
-        )
-        df_unique = df[["username", "can_create"]].drop_duplicates()
-        df = df_unique.merge(df_roles, on="username")
-        df = df.sort_values(by=["username"])
-        return df.to_dict("records")
-
-    def get_all_roles_list(self, engine):
-        df = self.get_all_roles(engine)
-        return df["role_name"].tolist()
-
-    @expose("/")
-    @admin_only
-    def main(self):
-        try:
-            uri = self.get_edw_connection_uri()
-            engine = create_engine(uri)
-            database_name = uri.split("/")[-1]
-            roles = self.get_roles_dependencies(engine)
-            users = self.get_users(engine, database_name)
-        except Exception as e:
-            flash("Could not connect to EDW. Check the connection configuration.", "danger")
-            print(f"PLUGIN FAILURE: {e}")
-            roles, users = [], []
-        return self.render_template("edw_grants.html", roles=roles, users=users)
-
-    @expose("/delete_role", methods=["DELETE"])
-    @admin_only
-    @failure_tollerant_front_end
-    def delete_role(self):
-        engine = self.get_edw_engine()
-        data = request.get_json()
-        role_name = data.get("role_downstream")
-        query = "drop role {role_name}"
-        self.sanitize_identifiers([role_name])
-        with engine.connect() as connection:
-            connection.execute(text(query.format(role_name=role_name)))
-
-    @expose("/delete_user", methods=["DELETE"])
-    @admin_only
-    @failure_tollerant_front_end
-    def delete_user(self):
-        engine = self.get_edw_engine()
-        data = request.get_json()
-        user_name = data.get("user_name")
-        query = "drop user {user_name}"
-        self.sanitize_identifiers([user_name])
-        with engine.connect() as connection:
-            connection.execute(text(query.format(user_name=user_name)))
-
-    @expose("/disable_user", methods=["PUT"])
-    @admin_only
-    @failure_tollerant_front_end
-    def disable_user(self):
-        engine = self.get_edw_engine()
-        data = request.get_json()
-        user_name = data.get("user_name")
-        self.sanitize_identifiers([user_name])
-        quoted_user_name = self.quote_identifier(user_name)
-        query = f"ALTER USER {quoted_user_name} PASSWORD DISABLE"
-        with engine.connect() as connection:
-            connection.execute(text(query))
-
-    @expose("/add_role_page", methods=["GET", "POST"])
-    @admin_only
-    @failure_tollerant
-    def add_role_page(self):
-        engine = self.get_edw_engine()
-        form = RolePermissionForm()
-        form.roles.choices = self.get_all_roles_list(engine)
-        create_role_q = "create role {role_name}"
-        grant_role_q = "grant role {dependent_role} to role {role_name}"
-        if form.validate_on_submit():
-            role_name = form.role_name.data
-            roles = form.roles.data
-            self.sanitize_identifiers([role_name] + roles)
-            with engine.connect() as connection:
-                with connection.begin():
-                    connection.execute(text(create_role_q.format(role_name=role_name)))
-                    for dependent_role in roles:
-                        connection.execute(
-                            text(
-                                grant_role_q.format(
-                                    role_name=role_name, dependent_role=dependent_role
-                                )
-                            )
-                        )
-            flash(f"Role Name: {role_name}, Related Roles: {roles}", "success")
-            return redirect(url_for("EdwGrantsAppBuilderBaseView.main"))
-        return self.render_template("add_role.html", form=form)
-
-    @expose("/edit_role_page/<string:role_name>/<string:roles>", methods=["GET", "PUT"])
-    @admin_only
-    @failure_tollerant
-    def edit_role_page(self, role_name, roles):
-        engine = self.get_edw_engine()
-        form = RolePermissionForm()
-        form.roles.choices = self.get_all_roles_list(engine)
-        if request.method == "GET":
-            form.roles.data = [role for role in roles.split(",")]
-            form.role_name.data = role_name
-            return self.render_template(
-                "edit_role.html", form=form, role_name=role_name
-            )
-        if request.method == "PUT" and form.validate_on_submit():
-            role_name = form.role_name.data
-            roles = form.roles.data
-            self.edit_roles_roles(engine, role_name, roles)
-            flash(f"Role Name: {role_name}, Related Roles: {roles}", "success")
-            return (
-                jsonify(
-                    {
-                        "message": "Role updated successfully",
-                        "role_name": role_name,
-                        "roles": roles,
-                    }
-                ),
-                200,
-            )
-
-    @expose("/edit_user_page/<string:user_name>/<string:roles>", methods=["GET", "PUT"])
-    @admin_only
-    @failure_tollerant
-    def edit_user_page(self, user_name, roles):
-        engine = self.get_edw_engine()
-        form = AddRolesToUser()
-        form.roles.choices = self.get_all_roles_list(engine)
-        if request.method == "GET":
-            form.roles.data = [role for role in roles.split(",")]
-            form.user_name.data = user_name
-            return self.render_template(
-                "edit_user.html", form=form, user_name=user_name
-            )
-        if request.method == "PUT" and form.validate_on_submit():
-            user_name = form.user_name.data
-            roles = form.roles.data
-            self.edit_users_roles(engine, user_name, roles)
-            flash(f"User Name: {user_name}, Related Roles: {roles}", "success")
-            return (
-                jsonify({"message": "User updated successfully", "roles": roles}),
-                200,
-            )
-
-    @expose("/add_user_page", methods=["GET", "POST"])
-    @admin_only
-    @failure_tollerant
-    def add_user_page(self):
-        engine = self.get_edw_engine()
-        database_name = self.get_edw_database()
-        form = NewUserForm()
-        form.roles.choices = self.get_all_roles_list(engine)
-        create_user_q = "create user {username} password :password"
-        grant_role_q = "grant role {dependent_role} to {username}"
-        grant_edit_database_q = "grant create on database {database_name} to {username}"
-        if form.validate_on_submit():
-            username = form.username.data
-            password = form.password.data
-            roles = form.roles.data
-            can_edit_database = form.can_edit_database.data
-            self.sanitize_identifiers([username, database_name] + roles)
-            with engine.connect() as connection:
-                with connection.begin():
-                    connection.execute(
-                        text(create_user_q.format(username=username)),
-                        {"password": password},
+                for r in roles:
+                    conn.execute(text(f"grant role {r} to {username}"))
+                if can_edit_database:
+                    conn.execute(
+                        text(f"grant create on database {database_name} to {username}")
                     )
-                    for dependent_role in roles:
-                        connection.execute(
-                            text(
-                                grant_role_q.format(
-                                    username=username, dependent_role=dependent_role
-                                )
-                            )
-                        )
-                    if can_edit_database:
-                        connection.execute(
-                            text(
-                                grant_edit_database_q.format(
-                                    username=username, database_name=database_name
-                                )
-                            )
-                        )
-            flash(f"Username: {username}, Related Roles: {roles}", "success")
-            return redirect(url_for("EdwGrantsAppBuilderBaseView.main"))
-        return self.render_template("add_user.html", form=form)
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+    return RedirectResponse(url=f"{URL_PREFIX}/", status_code=302)
 
-    @expose("/update_edit_db_grant", methods=["PUT"])
-    @admin_only
-    @failure_tollerant_front_end
-    def update_edit_db_grant(self):
-        data = request.get_json()
-        status = data.get("status")
-        username = data.get("username")
-        if status == "true":
-            db_edit_grants_q = "grant create on database {database_name} to {username}"
+
+@app.put("/update_edit_db_grant")
+async def update_edit_db_grant(body: UpdateDbGrantBody):
+    try:
+        engine = get_edw_engine()
+        database_name = get_edw_database()
+        sanitize_identifiers([body.username, database_name])
+        if body.status == "true":
+            q = f"grant create on database {database_name} to {body.username}"
         else:
-            db_edit_grants_q = (
-                "revoke create on database {database_name} from {username}"
-            )
-        engine = self.get_edw_engine()
-        database_name = self.get_edw_database()
-        with engine.connect() as connection:
-            self.sanitize_identifiers([username, database_name])
-            connection.execute(
-                text(
-                    db_edit_grants_q.format(
-                        username=username, database_name=database_name
-                    )
-                )
-            )
+            q = f"revoke create on database {database_name} from {body.username}"
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text(q))
+        return JSONResponse({"Status": "Succeeded"})
+    except Exception as e:
+        print(f"PLUGIN FAILURE: {e}")
+        return JSONResponse({"Status": "Failed"}, status_code=500)
 
 
-v_appbuilder_view = EdwGrantsAppBuilderBaseView()
-v_appbuilder_package = {
-    "name": "Permissions",
-    "category": "EDW",
-    "view": v_appbuilder_view,
-}
-
+# ---------------------------------------------------------------------------
+# Plugin registration
+# ---------------------------------------------------------------------------
 
 class AirflowEdwGrantsPlugin(AirflowPlugin):
     name = "edw_grants_plugin"
-    hooks = []
-    macros = []
-    flask_blueprints = [bp]
-    appbuilder_views = [v_appbuilder_package]
-    appbuilder_menu_items = []
+    fastapi_apps = [{
+        "app": app,
+        "url_prefix": "/edw_grants",
+        "name": "EDW Grants",
+    }]
+    external_views = [{
+        "name": "Permissions",
+        "href": "/edw_grants/",
+        "destination": "nav",
+        "category": "EDW",
+        "url_route": "edw_grants",
+    }]

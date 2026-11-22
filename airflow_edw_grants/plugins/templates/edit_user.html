@@ -1,70 +1,60 @@
-{% extends base_template %}
-<!-- Load Select2 CSS -->
-<!-- <link href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css" rel="stylesheet" /> -->
-
-<!-- Load Select2 JS -->
-<!-- <script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script> -->
-{% block title %} My Custom Form {% endblock %}
-
-{% block content %}
-<!-- Load Select2 CSS -->
-<link href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css" rel="stylesheet" />
-
-<!-- Load Select2 JS -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
-
-<div class="container">
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EDW Grants – Edit User</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/css/select2.min.css">
+</head>
+<body>
+<nav class="navbar navbar-dark bg-dark">
+  <span class="navbar-brand mb-0 h1">EDW Grants</span>
+  <a class="nav-link text-white" href="{{ prefix }}/">← Back</a>
+</nav>
+<div class="container mt-4">
   <h2>Edit User</h2>
   <form id="edit-user-form">
-    {{ form.hidden_tag() }}
     <div class="form-group">
-      <label for="free_text">User Name</label>
-      {{ form.user_name(class="form-control", readonly="readonly") }}
+      <label>User Name</label>
+      <input type="text" name="user_name" class="form-control" value="{{ user_name }}" readonly>
     </div>
     <div class="form-group">
-      <label for="roles">Roles</label>
-      {{ form.roles(class="form-control select2", multiple="multiple") }}
+      <label>Roles</label>
+      <select name="roles" multiple class="form-control select2">
+        {% for role in all_roles %}
+        <option value="{{ role }}" {% if role in current_roles %}selected{% endif %}>{{ role }}</option>
+        {% endfor %}
+      </select>
     </div>
-    <div class="form-group">
-      {{ form.submit(class="btn btn-primary") }}
-    </div>
+    <button type="submit" class="btn btn-primary">Submit</button>
   </form>
 </div>
 
-<!-- Initialize Select2 -->
-<script type="text/javascript">
+<script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@4.6.2/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/select2/4.0.13/js/select2.min.js"></script>
+<script>
+  const _prefix = "{{ prefix }}";
+
   $(document).ready(function () {
-    $('.select2').select2({
-      placeholder: "Choose options",
-      allowClear: true
-    });
+    $('.select2').select2({ placeholder: "Choose options", allowClear: true });
 
     $('#edit-user-form').on('submit', function (event) {
       event.preventDefault();
-
-      const form = $(this);
-      const formData = new FormData(form[0]);
+      const formData = new FormData(this);
       const userName = formData.get('user_name');
       const roles = formData.getAll('roles');
-      const url = "{{ url_for('EdwGrantsAppBuilderBaseView.edit_user_page', user_name='USER_NAME_PLACEHOLDER', roles='ROLES_PLACEHOLDER') }}"
-               .replace('USER_NAME_PLACEHOLDER', userName)
-               .replace('ROLES_PLACEHOLDER', roles.join(','));
+      const url = `${_prefix}/edit_user_page/${encodeURIComponent(userName)}/${roles.join(',')}`;
       fetch(url, {
         method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-CSRFToken': '{{ csrf_token() }}'
-        },
-        body: JSON.stringify({
-          user_name: userName,
-          roles: roles
-        })
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_name: userName, roles: roles })
       })
       .then(response => response.json())
-      .then(data => {
-        window.location.href = "{{ url_for('EdwGrantsAppBuilderBaseView.main') }}";
-      })
+      .then(() => { window.location.href = `${_prefix}/`; });
     });
   });
 </script>
-{% endblock %}
+</body>
+</html>
