@@ -6,6 +6,7 @@ x-airflow-common:
     dockerfile: .Dockerfile
   env_file:
     - common-airflow.env
+    - connections.env
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor

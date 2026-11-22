@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "airflow-edw-grants"
-version = "0.2.1"
+version = "0.2.2"
 description = "An Apache Airflow plugin for managing users and roles in an Enterprise Data Warehouse (EDW) and establishing connections between them, specifically for Amazon Redshift."
 license = "MIT"
 authors = ["Ponder"]
@@ -10,7 +10,6 @@ readme = "README.md"
 python = ">=3.10,<3.14"
 apache-airflow = ">=3.0.0"
 pandas = ">=1.3.5"
-sqlalchemy-redshift = ">=0.8.11"
 SQLAlchemy = ">=2.0.0"
 
 [tool.poetry.dev-dependencies]

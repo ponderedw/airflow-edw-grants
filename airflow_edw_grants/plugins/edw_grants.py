@@ -1,11 +1,15 @@
 import os
 import re
+import urllib.parse
 
 import pandas as pd
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from airflow.hooks.base import BaseHook
+try:
+    from airflow.sdk.bases.hook import BaseHook  # Airflow 3
+except ImportError:
+    from airflow.hooks.base import BaseHook  # Airflow 2 fallback
 from airflow.models import Variable
 from airflow.plugins_manager import AirflowPlugin
 from pydantic import BaseModel
@@ -20,10 +24,6 @@ from sqlalchemy import (
     select,
     text,
 )
-from sqlalchemy_redshift.dialect import RedshiftDialect_psycopg2
-
-RedshiftDialect_psycopg2.supports_statement_cache = True
-
 URL_PREFIX = "/edw_grants"
 
 app = FastAPI()
@@ -70,8 +70,15 @@ def is_iam_user(username: str) -> bool:
 
 def get_edw_connection_uri():
     conn_name = Variable.get("redshift_connection_grants_name", default_var="edw_con")
-    connection = BaseHook.get_connection(conn_name)
-    return connection.get_uri()
+    conn = BaseHook.get_connection(conn_name)
+    # Build URI manually so special chars in passwords are always URL-encoded
+    # and the redshift+psycopg2 dialect is used regardless of conn_type.
+    login = urllib.parse.quote(conn.login or "", safe="")
+    password = urllib.parse.quote(conn.password or "", safe="")
+    host = conn.host or ""
+    port = conn.port or 5439
+    schema = conn.schema or ""
+    return f"postgresql+psycopg2://{login}:{password}@{host}:{port}/{schema}"
 
 
 def get_edw_engine():
@@ -279,9 +286,7 @@ async def main(request: Request, flash: str = None):
         error = None
     except Exception as e:
         print(f"PLUGIN FAILURE: {e}")
-        roles, users, error = [], [], (
-            "Could not connect to EDW. Check the connection configuration."
-        )
+        roles, users, error = [], [], f"Could not connect to EDW: {e}"
     return templates.TemplateResponse(request, "edw_grants.html", {
         "roles": roles,
         "users": users,

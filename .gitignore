@@ -37,3 +37,4 @@ Thumbs.db
 
 
 local_airflow/pgdata
+local_airflow_3/connections.env
